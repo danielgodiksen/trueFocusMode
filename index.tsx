@@ -75,6 +75,7 @@ const settings = definePluginSettings({
 
     onlyOwnMessages: { type: OptionType.BOOLEAN, description: "Show only your own messages in a channel (todo-list mode)", default: true },
     allowedUserIds: { type: OptionType.STRING, description: "Other user IDs whose messages stay visible (comma separated)", default: "1487524020277739674" },
+    showOthersInChannels: { type: OptionType.STRING, description: "Channel IDs where EVERYONE's messages stay visible (todo-list mode off there; comma separated)", default: "" },
     blockChannelLinks: { type: OptionType.BOOLEAN, description: "Block opening other channels via links / mentions", default: true },
 
     channelTimeLockout: { type: OptionType.NUMBER, description: "Lock the UI after this many minutes in one channel (0 = off)", default: 20 },
@@ -175,6 +176,17 @@ function setBodyClasses(active: boolean, phase: string, mode: string) {
     c.toggle("tfm-solo", active && s.soloServerMode && !!solo);
     c.toggle("tfm-pomodoro", active && mode === "pomodoro" && phase === "work");
     c.toggle("tfm-msgfilter", active && s.onlyOwnMessages);
+}
+
+// Message filter is per-channel: it turns OFF in the channels listed in
+// showOthersInChannels (the visible message list is always the current channel).
+function applyMsgFilter(regimeActive: boolean) {
+    const s = settings.store;
+    const cur = String((SelectedChannelStore as any).getChannelId?.() ?? "");
+    const bypass = cur !== "" && parseIds(s.showOthersInChannels).includes(cur);
+    const on = regimeActive && s.onlyOwnMessages && !bypass;
+    document.body.classList.toggle("tfm-msgfilter", on);
+    if (on) startMsgObserver(); else stopMsgObserver();
 }
 
 // ---------------------------------------------------------------------------
@@ -359,7 +371,7 @@ function useDrag(initial: { x: number; y: number; }) {
 // Root component
 // ---------------------------------------------------------------------------
 interface TimerState {
-    mode: Mode; phase: Phase; running: boolean;
+    mode: Mode; phase: Phase; running: boolean; paused: boolean; resting: boolean;
     remaining: number; total: number; elapsed: number;
     cycle: number; isBreakLong: boolean; plannedLen: number;
 }
@@ -367,7 +379,7 @@ interface TimerState {
 function App() {
     const stateRef = React.useRef<TimerState>({
         mode: settings.store.technique as Mode,
-        phase: "idle", running: false,
+        phase: "idle", running: false, paused: false, resting: false,
         remaining: mins(settings.store.workDuration) || 1500,
         total: mins(settings.store.workDuration) || 1500,
         elapsed: 0, cycle: 0, isBreakLong: false,
@@ -413,7 +425,7 @@ function App() {
         settings.store.hideBackForward, settings.store.hidePinned, settings.store.hideThreads,
         settings.store.hideDiscover, settings.store.hideServerFolders, settings.store.soloServerMode,
         settings.store.soloServerId, settings.store.keepHomeButton, settings.store.allowedFoldersInPomodoro,
-        settings.store.onlyOwnMessages, settings.store.allowedUserIds
+        settings.store.onlyOwnMessages, settings.store.allowedUserIds, settings.store.showOthersInChannels
     ].join("|");
 
     React.useEffect(() => {
@@ -422,8 +434,7 @@ function App() {
         regimeActiveRef.current = regimeActive;
         sessionActiveRef.current = sessionActive;
         patchHistory(regimeActive && settings.store.hideBackForward);
-        if (regimeActive && settings.store.onlyOwnMessages) startMsgObserver();
-        else stopMsgObserver();
+        applyMsgFilter(regimeActive);
         if (regimeActive) channelRef.current = { id: (SelectedChannelStore as any).getChannelId?.() ?? null, ts: Date.now() };
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [cssKey]);
@@ -456,7 +467,7 @@ function App() {
     // ---- timer transitions -------------------------------------------------
     function startWork() {
         const s = stateRef.current;
-        s.phase = "work"; s.running = true;
+        s.phase = "work"; s.running = true; s.paused = false; s.resting = false;
         if (s.mode === "pomodoro") { s.total = mins(s.plannedLen) || 1500; s.remaining = s.total; }
         else { s.elapsed = 0; }
         channelRef.current = { id: (SelectedChannelStore as any).getChannelId?.() ?? null, ts: Date.now() };
@@ -474,7 +485,7 @@ function App() {
             const ratio = settings.store.flowmodoroRatio > 0 ? settings.store.flowmodoroRatio : 5;
             secs = Math.max(60, Math.floor(s.elapsed / ratio));
         }
-        s.cycle += 1; s.phase = "break"; s.isBreakLong = long;
+        s.cycle += 1; s.phase = "break"; s.isBreakLong = long; s.paused = false; s.resting = false;
         s.total = secs; s.remaining = secs; s.running = true;
         rerender();
         notify("Break time", s.mode === "flowmodoro"
@@ -485,12 +496,12 @@ function App() {
 
     function tick() {
         const s = stateRef.current;
-        if (sessionActiveRef.current && settings.store.channelTimeLockout > 0 && channelRef.current.id) {
+        if (sessionActiveRef.current && !s.paused && settings.store.channelTimeLockout > 0 && channelRef.current.id) {
             if (Date.now() - channelRef.current.ts > settings.store.channelTimeLockout * 60000) triggerLock("time");
         }
-        if (!s.running || s.phase === "idle") return;
+        if (!s.running || s.phase === "idle" || s.paused) return;   // paused: block holds, clock frozen
         if (s.phase === "work" && s.mode === "flowmodoro") { s.elapsed += 1; rerender(); return; }
-        s.remaining -= 1;
+        s.remaining -= 1;   // "rest" does NOT stop this — block runs to the original end
         if (s.remaining <= 0) { s.phase === "work" ? startBreak() : finishBreak(); }
         else rerender();
     }
@@ -509,7 +520,7 @@ function App() {
     // ---- controls ----------------------------------------------------------
     function requestStart() {
         const s = stateRef.current;
-        if (s.phase !== "idle") { s.running = true; rerender(); return; }
+        if (s.phase !== "idle") { s.paused = false; rerender(); return; }
         if (settings.store.confirmSessionLength) {
             setConfirmLen(s.mode === "pomodoro" ? (settings.store.workDuration || 25) : 0);
             setConfirming(true);
@@ -521,10 +532,13 @@ function App() {
         setConfirming(false);
         startWork();
     }
-    function onPause() { const s = stateRef.current; s.running = false; rerender(); }
+    // Pause: freeze the clock but KEEP the block on (can't browse). Rest: keep the
+    // clock running to the original end (a break that doesn't unblock you early).
+    function togglePause() { const s = stateRef.current; if (s.phase === "idle") return; s.paused = !s.paused; rerender(); }
+    function toggleRest() { const s = stateRef.current; if (s.phase !== "work") return; s.resting = !s.resting; s.paused = false; rerender(); }
     function onReset() {
         const s = stateRef.current;
-        s.phase = "idle"; s.running = false; s.elapsed = 0; s.cycle = 0; s.isBreakLong = false;
+        s.phase = "idle"; s.running = false; s.paused = false; s.resting = false; s.elapsed = 0; s.cycle = 0; s.isBreakLong = false;
         s.total = mins(settings.store.workDuration) || 1500; s.remaining = s.total;
         abortArmed.current = false;
         rerender();
@@ -547,7 +561,7 @@ function App() {
         const s = stateRef.current;
         if (s.mode === m) return;
         s.mode = m; settings.store.technique = m;
-        s.phase = "idle"; s.running = false; s.elapsed = 0;
+        s.phase = "idle"; s.running = false; s.paused = false; s.resting = false; s.elapsed = 0;
         s.total = mins(settings.store.workDuration) || 1500; s.remaining = s.total;
         rerender();
     }
@@ -556,6 +570,7 @@ function App() {
     React.useEffect(() => {
         const onChannelSelect = (e: any) => {
             channelRef.current = { id: e?.channelId ?? (SelectedChannelStore as any).getChannelId?.() ?? null, ts: Date.now() };
+            applyMsgFilter(regimeActiveRef.current);
         };
         const onMessageCreate = (e: any) => {
             if (!sessionActiveRef.current) return;
@@ -604,7 +619,7 @@ function App() {
         const id = setInterval(tick, 1000);
 
         api.start = requestStart;
-        api.pause = onPause;
+        api.pause = togglePause;
         api.stop = onReset;
         api.skip = onSkip;
         api.panel = () => setFocusOpen(v => !v);
@@ -631,7 +646,10 @@ function App() {
     const display = st.phase === "idle"
         ? (st.mode === "flowmodoro" ? 0 : mins(st.plannedLen) || 1500)
         : isFlowWork ? st.elapsed : Math.max(0, st.remaining);
-    const phaseLabel = st.phase === "idle" ? "Ready" : st.phase === "work" ? "Focus" : (st.isBreakLong ? "Long break" : "Break");
+    const phaseLabel = st.phase === "idle" ? "Ready"
+        : st.paused ? "Paused"
+            : st.phase === "work" ? (st.resting ? "Resting" : "Focus")
+                : (st.isBreakLong ? "Long break" : "Break");
     const barColor = st.phase === "break" ? GREEN : ACCENT;
     const progress = (!isFlowWork && st.phase !== "idle" && st.total > 0)
         ? Math.min(1, Math.max(0, 1 - st.remaining / st.total)) : (isFlowWork ? 1 : 0);
@@ -661,7 +679,7 @@ function App() {
                 display: "flex", gap: 6, padding: 5, borderRadius: 9, cursor: "grab",
                 background: HEADER, boxShadow: "0 4px 16px rgba(0,0,0,.35)"
             }}>
-                <LaunchBtn on={focusOpen} onClick={() => setFocusOpen(v => !v)}>⌖ Focus{st.running ? ` · ${fmt(display)}` : (settings.store.alwaysOn ? " · on" : "")}</LaunchBtn>
+                <LaunchBtn on={focusOpen} onClick={() => setFocusOpen(v => !v)}>⌖ Focus{st.running ? `${st.paused ? " · paused" : ` · ${fmt(display)}`}` : (settings.store.alwaysOn ? " · on" : "")}</LaunchBtn>
                 <LaunchBtn on={corticalOpen} onClick={() => setCorticalOpen(v => !v)}>◇ Cortical</LaunchBtn>
                 <LaunchBtn on={false} onClick={openSettings}>⚙</LaunchBtn>
             </div>
@@ -707,28 +725,39 @@ function App() {
                         </div>
 
                         <div style={{ fontSize: 10.5, color: MUTED, minHeight: 14, marginBottom: 10 }}>
-                            {isFlowWork
-                                ? `break ≈ ${fmt(Math.max(60, Math.floor(st.elapsed / ratio)))} (work ÷ ${ratio})`
-                                : st.phase === "idle"
-                                    ? (st.mode === "pomodoro" ? `${st.plannedLen}m work · ${settings.store.breakDuration}m break` : `count up, then break = work ÷ ${ratio}`)
-                                    : `${fmt(st.remaining)} left`}
+                            {st.paused
+                                ? "paused — clock frozen, Discord stays blocked"
+                                : st.phase === "work" && st.resting
+                                    ? `resting — blocked until the timer ends (${fmt(st.remaining)})`
+                                    : isFlowWork
+                                        ? `break ≈ ${fmt(Math.max(60, Math.floor(st.elapsed / ratio)))} (work ÷ ${ratio})`
+                                        : st.phase === "idle"
+                                            ? (st.mode === "pomodoro" ? `${st.plannedLen}m work · ${settings.store.breakDuration}m break` : `count up, then break = work ÷ ${ratio}`)
+                                            : `${fmt(st.remaining)} left`}
                         </div>
 
-                        {locked ? (
-                            settings.store.allowAbort ? (
-                                <div style={{ display: "flex", gap: 6 }}>
-                                    <Btn danger onClick={onAbort}>{abortArmed.current ? "Tap again to abort" : "Abort"}</Btn>
-                                </div>
-                            ) : (
-                                <div style={{ fontSize: 10.5, color: MUTED, textAlign: "center", padding: "6px 0" }}>🔒 Locked until the block ends</div>
-                            )
-                        ) : (
+                        {st.phase === "idle" ? (
                             <div style={{ display: "flex", gap: 6 }}>
-                                {!st.running
-                                    ? <Btn accent onClick={requestStart}>{st.phase === "idle" ? "Start" : "Resume"}</Btn>
-                                    : <Btn onClick={onPause}>Pause</Btn>}
-                                {isFlowWork ? <Btn accent onClick={onSkip}>Take break</Btn> : <Btn onClick={onSkip}>Skip</Btn>}
-                                <Btn onClick={onReset}>Reset</Btn>
+                                <Btn accent onClick={requestStart}>Start</Btn>
+                            </div>
+                        ) : (
+                            <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                                {/* Pause keeps the block on; safe to allow even when locked */}
+                                <Btn accent={st.paused} onClick={togglePause}>{st.paused ? "Resume" : "Pause"}</Btn>
+
+                                {/* Work: "Break" rests you but the clock keeps running to the original end */}
+                                {st.phase === "work" && !isFlowWork && (
+                                    <Btn onClick={toggleRest}>{st.resting ? "Back to work" : "Break"}</Btn>
+                                )}
+                                {isFlowWork && <Btn accent onClick={onSkip}>Take break</Btn>}
+
+                                {/* Break -> work is not a bypass (more hidden), so allow it */}
+                                {st.phase === "break" && <Btn onClick={onSkip}>Skip break</Btn>}
+
+                                {/* Skip work->break and Reset only when not locked */}
+                                {!locked && st.phase === "work" && !isFlowWork && <Btn onClick={onSkip}>Skip</Btn>}
+                                {!locked && <Btn onClick={onReset}>Reset</Btn>}
+                                {locked && settings.store.allowAbort && <Btn danger onClick={onAbort}>{abortArmed.current ? "Tap again" : "Abort"}</Btn>}
                             </div>
                         )}
                     </div>

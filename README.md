@@ -35,6 +35,10 @@ If you ever replace `cortical-load_2.html` with a newer version, regenerate `cor
 - **Always-on lockdown.** Turn on **Keep hiding / blocking ON at all times** and the whole hiding regime (servers, channels, members, folders, back/forward, link-blocking, only-own-messages, solo-server, channel restriction) applies continuously — no session required. The timer-driven **lock-outs** (channel-time / message-rate "go study" screen) still only fire during a real session, so always-on won't nag you while you're just restricting your view.
 - **Only specific channels.** Turn on **Show ONLY specific channels** and put channel IDs in **allowedChannelIds** (right-click a channel → Copy Channel ID). Every other channel in the sidebar is hidden. Pair it with **Hide the whole server list** or **solo-server** to lock yourself down to a handful of channels. (Leave *Hide the channel sidebar* off when using this — that one hides the sidebar entirely.)
 - **One-tap settings.** A ⚙ button on the launcher bar and in both the Focus and Cortical headers jumps straight to Vencord's Plugins page, so you're not digging through menus to change a value.
+- **Per-channel message visibility.** Todo-list mode (only-your-messages) now has an exception list: **showOthersInChannels** takes channel IDs where *everyone's* messages stay visible, while every other channel still hides others. So one channel can be a normal conversation while the rest stay filtered.
+- **Pause & Break that can't be used to escape.**
+  - **Pause** freezes the clock but keeps the block on — you can't browse Discord while paused, and paused time doesn't count down, so it can only lengthen the block, never shorten it. Available even when the block is locked.
+  - **Break** (Pomodoro work) lets you rest, but the clock keeps running to the block's original end, so Discord stays blocked until the time you committed to has actually passed — no bypassing the block faster. Available even when locked. ("Take break" in Flowmodoro is unchanged — you earn a proportional break by working.)
 
 ## Finding IDs
 
