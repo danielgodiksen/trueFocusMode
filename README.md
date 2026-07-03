@@ -1,6 +1,6 @@
 # trueFocusMode
 
-A Vencord **userplugin** that turns Discord into a focus environment while a Pomodoro/Flowmodoro timer runs, plus an in-client popup for your **Cortical Load** app. Configure everything in **Settings → Plugins → trueFocusMode**.
+A Vencord **userplugin** that turns Discord into a focus environment while a Pomodoro/Flowmodoro timer runs, plus an in-client popup for your **Cortical Load** app. It scales from a soft nudge to a hard commitment device: an ordinary block just hides distractions, while a **strict** block survives reloads and restarts, can't be aborted, and refuses to let the plugin be disabled until it ends (see [TRUE STRICT MODE](#true-strict-mode-survives-reload--restart)). Configure everything in **Settings → Plugins → trueFocusMode**.
 
 ## Install (userplugins need Vencord built from source)
 
@@ -27,7 +27,7 @@ If you ever replace `cortical-load_2.html` with a newer version, regenerate `cor
 ## Other fixes from your report
 
 - **Todo-list mode no longer glitches.** Foreign messages are hidden with `visibility:hidden` (their height is kept), so Discord's scroller no longer keeps loading history to "fill" the view. Trade-off: hidden messages leave blank gaps rather than collapsing — that's the price of a stable, non-flickering list. Each message is tagged once, so scanning stays cheap.
-- **Unabortable blocks.** New setting **Allow aborting a locked block**. Off = the work block can't be aborted from the panel. Reloading Discord (Ctrl/Cmd+R) always resets the timer, so you're never truly trapped.
+- **Unabortable blocks.** New setting **Allow aborting a locked block**. Off = the work block can't be aborted from the panel. Reloading Discord (Ctrl/Cmd+R) resets the timer as an escape hatch — *unless* **strictMode** is on, which closes even that on purpose (see [TRUE STRICT MODE](#true-strict-mode-survives-reload--restart)).
 - **Back/forward is actually blocked now** (my old aria-label guess was wrong). While focusing it neutralises `history.back/forward/go`, blocks the mouse side-buttons (buttons 3/4) and **Alt+←/→**. The on-screen buttons are also hidden via CSS if the label guess matches — but even if it doesn't, the navigation itself does nothing.
 - **Folders are matched by NAME now.** `allowedFoldersInPomodoro` takes folder names (comma separated) revealed during Pomodoro work blocks — see VERIFY note.
 
