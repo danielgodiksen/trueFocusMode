@@ -8,12 +8,13 @@ A Vencord **userplugin** that turns Discord into a focus environment while a Pom
 git clone https://github.com/Vendicated/Vencord
 cd Vencord && pnpm i
 mkdir -p src/userplugins/trueFocusMode
-# copy index.tsx and corticalLoadAsset.ts into that folder
+# copy the ENTIRE trueFocusMode folder (all .ts / .tsx files) into that folder
 pnpm build && pnpm inject
 ```
-Then **Ctrl/Cmd+R**, enable **trueFocusMode** in Settings → Plugins. A draggable `⌖ Focus / ◇ Cortical` bar appears at the top.
+Then **Ctrl/Cmd+R**, enable **trueFocusMode** in Settings → Plugins. A draggable `⌖ Focus / ◇ Cortical / ⚙` bar appears at the top.
 
-Folder must contain: `index.tsx`, `corticalApp.ts`, and `corticalLoadAsset.ts`.
+The plugin is split across several files — copy **all** of them:
+`index.tsx` (UI + wiring), `settings.ts` (settings + the lock latch), `environment.ts` (DOM hiding, message filter, nav block), `cortical.ts` + `corticalApp.ts` + `corticalLoadAsset.ts` (the Cortical Load popup), `state.ts`, `discord.ts`, `util.ts`, `ui.tsx`.
 
 ## Cortical Load (fixed — no more "didn't start")
 
@@ -40,13 +41,22 @@ If you ever replace `cortical-load_2.html` with a newer version, regenerate `cor
   - **Pause** freezes the clock but keeps the block on — you can't browse Discord while paused, and paused time doesn't count down, so it can only lengthen the block, never shorten it. Available even when the block is locked.
   - **Break** (Pomodoro work) lets you rest, but the clock keeps running to the block's original end, so Discord stays blocked until the time you committed to has actually passed — no bypassing the block faster. Available even when locked. ("Take break" in Flowmodoro is unchanged — you earn a proportional break by working.)
 
+## Locked sessions & tamper-resistance
+
+When **Lock a work block once started** is on, starting a block "commits" it. For the whole committed session — work **and** breaks — the plugin:
+
+- **Freezes every setting.** It reads its behaviour from a snapshot taken at start, and reverts any change you make in the Vencord panel within a second. So you can't flip *allow abort*, *hide back/forward*, a hide toggle, or a lock-out threshold mid-block to weaken it. This fixes the two bypasses you hit: enabling abort mid-unabortable-session, and disabling the navigation option to unlock it — both are now ignored until the block ends.
+- **Gates every exit.** Skip-to-break, Reset, and the `/focus stop` / `/focus skip` slash actions are blocked during a locked work block; the only sanctioned exit is **Abort**, and only if you left *allow abort* on when you started.
+
+**Honest limits (please read):** a Vencord plugin is JavaScript running *inside* Discord. It genuinely **cannot** make itself undeletable, cannot lock or hide its settings file on disk, and cannot stop you quitting Discord — those need OS-level power a client plugin doesn't have, and a plugin that fought its own removal would be malware-like *and* still wouldn't survive a quit or an edit made while Discord is closed. So: **quitting or reloading Discord always ends the block**, and editing the files on disk while it's closed always works. What's above hardens the *running client*, which is where every bypass you listed happens. If you want a hard OS-level block too, pair this with a separate app like Cold Turkey / LeechBlock that operates at that level.
+
 ## Finding IDs
 
-Enable **Developer Mode** (Settings → Advanced), then right-click → **Copy Server ID** (`soloServerId`) / **Copy User ID** (`allowedUserIds`; lionbot `1487524020277739674` is pre-filled).
+Enable **Developer Mode** (Settings → Advanced), then right-click → **Copy Server ID** (`soloServerId`) / **Copy Channel ID** (`allowedChannelIds`, `showOthersInChannels`) / **Copy User ID** (`allowedUserIds`; lionbot `1487524020277739674` is pre-filled).
 
 ## Selectors to VERIFY (Discord ships hashed classes)
 
-If something doesn't hide, right-click it → **Inspect**, then update the rule in `index.tsx`:
+If something doesn't hide, right-click it → **Inspect**, then update the rule in `environment.ts`:
 - **Solo server** — assumes guild items are `[data-list-item-id="guildsnav___<id>"]` (`buildDynamicCss`).
 - **Only specific channels** — assumes channel items are `[data-list-item-id="channels___<id>"]` (`buildDynamicCss`).
 - **Folders (hide all)** — assumes the folder wrapper class contains `folder_` (`STATIC_CSS`).
@@ -56,7 +66,11 @@ If something doesn't hide, right-click it → **Inspect**, then update the rule 
 
 Reliable: channel sidebar, server list, member list + button, Pinned, Threads, and the fiber-based own-messages filter.
 
+## File layout
+
+`index.tsx` UI + timer state machine + plugin entry · `settings.ts` settings + enforcement latch · `environment.ts` DOM hiding, message filter, history block · `cortical.ts` + `corticalApp.ts` + `corticalLoadAsset.ts` the popup · `state.ts` shared refs + settings shortcut · `discord.ts` webpack lookups · `util.ts` helpers/tokens · `ui.tsx` buttons.
+
 ## Notes
 
-- Everything (hiding, link-blocking, message filter, lock-outs, history block) applies **only during an active session** — and during breaks only if *Hide during break* is on. Otherwise Discord is untouched.
+- Hiding, link-blocking, the message filter, the history block and the navigation block apply during an active session (and during breaks only if *Hide during break* is on), **or continuously** if *always-on* is set. Otherwise Discord is untouched. The "go study" lock-outs only fire during a real session.
 - The own-messages filter reads each message's author from its React fiber, so it handles default-avatar users and the allow-list without fragile source patches; if a future Discord refactor changes the prop shape it simply shows everything.
