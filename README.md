@@ -14,7 +14,7 @@ pnpm build && pnpm inject
 Then **Ctrl/Cmd+R**, enable **trueFocusMode** in Settings → Plugins. A draggable `⌖ Focus / ◇ Cortical / ⚙` bar appears at the top.
 
 The plugin is split across several files — copy **all** of them:
-`index.tsx` (UI + wiring), `settings.ts` (settings + the lock latch), `environment.ts` (DOM hiding, message filter, nav block), `cortical.ts` + `corticalApp.ts` + `corticalLoadAsset.ts` (the Cortical Load popup), `state.ts`, `discord.ts`, `util.ts`, `ui.tsx`.
+`index.tsx` (UI + wiring), `settings.ts` (settings + the lock latch), `vault.ts` (encrypted config + strict-session persistence), `environment.ts` (DOM hiding, message filter, nav block), `cortical.ts` + `corticalApp.ts` + `corticalLoadAsset.ts` (the Cortical Load popup), `state.ts`, `discord.ts`, `util.ts`, `ui.tsx`.
 
 ## Cortical Load (fixed — no more "didn't start")
 
@@ -46,9 +46,24 @@ If you ever replace `cortical-load_2.html` with a newer version, regenerate `cor
 When **Lock a work block once started** is on, starting a block "commits" it. For the whole committed session — work **and** breaks — the plugin:
 
 - **Freezes every setting.** It reads its behaviour from a snapshot taken at start, and reverts any change you make in the Vencord panel within a second. So you can't flip *allow abort*, *hide back/forward*, a hide toggle, or a lock-out threshold mid-block to weaken it. This fixes the two bypasses you hit: enabling abort mid-unabortable-session, and disabling the navigation option to unlock it — both are now ignored until the block ends.
-- **Gates every exit.** Skip-to-break, Reset, and the `/focus stop` / `/focus skip` slash actions are blocked during a locked work block; the only sanctioned exit is **Abort**, and only if you left *allow abort* on when you started.
+- **Gates every exit.** Skip-to-break, Reset, and the `/focus stop` / `/focus skip` slash actions are blocked during a locked work block; the sanctioned exits are **Abort** (only if you left *allow abort* on when you started) and — new — **Reset during a break**, which ends the committed session between blocks. That break-time exit exists so a strict session can always end *somewhere* now that reloading no longer resets it.
 
-**Honest limits (please read):** a Vencord plugin is JavaScript running *inside* Discord. It genuinely **cannot** make itself undeletable, cannot lock or hide its settings file on disk, and cannot stop you quitting Discord — those need OS-level power a client plugin doesn't have, and a plugin that fought its own removal would be malware-like *and* still wouldn't survive a quit or an edit made while Discord is closed. So: **quitting or reloading Discord always ends the block**, and editing the files on disk while it's closed always works. What's above hardens the *running client*, which is where every bypass you listed happens. If you want a hard OS-level block too, pair this with a separate app like Cold Turkey / LeechBlock that operates at that level.
+## TRUE STRICT MODE (survives reload & restart)
+
+Turn on **strictMode** and a locked block becomes a real commitment:
+
+- **Reloading or quitting Discord no longer ends the block.** The block's frozen settings snapshot and its wall-clock end time are sealed (encrypted) into the plugin's IndexedDB store and re-sealed every 15 seconds. On the next launch the block **resumes where the clock left off** — the commitment is to a wall-clock end time, so a Ctrl+R, a full restart, or a "quit and come back" all land you back inside the same block until that time has truly passed. If the block finished while Discord was closed, you just get a "block complete" note.
+- **Strict blocks can never be aborted.** *allow abort* is forced off in the snapshot; the Abort and Reset buttons don't exist during a strict work block. Pause and Break still work (they can only lengthen the block, never shorten it).
+- **The plugin can't be disabled mid-block.** Toggling trueFocusMode off in Settings → Plugins during a strict work block fails: the plugin refuses to stop, Vencord reports the failure, and it stays enabled — so "disable, then reload" is not an escape either. Once the work block ends (break time), disabling works normally.
+
+## Encrypted config (settings live in the vault, not settings.json)
+
+The plugin's authoritative config is an **AES-256-GCM encrypted copy** of every protected setting, stored in Vencord's DataStore (IndexedDB) under `tfm:vault:*`. What that buys you:
+
+- **Editing `settings.json` on disk does nothing.** At startup — before the UI mounts — the vault decrypts its sealed copy and overwrites whatever is on disk. An edit made while Discord was closed is reverted before it ever takes effect. (GCM is authenticated, so a tampered blob simply fails to decrypt rather than feeding you attacker-chosen values.)
+- **The Discord UI is the only sanctioned way to change config.** Changes you make in the Vencord panel while *no locked block is running* are re-sealed into the vault within a second, and survive normally. During a locked block the freeze latch reverts them, as before.
+
+**Honest limits (please read):** a Vencord plugin is JavaScript running *inside* Discord, so this is **tamper-resistance, not real secrecy** — the AES key necessarily lives in the same IndexedDB (a client plugin has no OS keychain). What's changed is *what it takes* to escape. Casual escapes (reload, quit, edit settings.json, flip a toggle) are all closed now. What remains requires deliberate, advanced tooling: devtools/IndexedDB surgery (delete the `tfm:vault:*` keys), changing the OS clock, or removing the plugin from Vencord's source and rebuilding. If you want a block even those can't touch, pair this with an OS-level tool like Cold Turkey / LeechBlock.
 
 ## Finding IDs
 
@@ -68,7 +83,7 @@ Reliable: channel sidebar, server list, member list + button, Pinned, Threads, a
 
 ## File layout
 
-`index.tsx` UI + timer state machine + plugin entry · `settings.ts` settings + enforcement latch · `environment.ts` DOM hiding, message filter, history block · `cortical.ts` + `corticalApp.ts` + `corticalLoadAsset.ts` the popup · `state.ts` shared refs + settings shortcut · `discord.ts` webpack lookups · `util.ts` helpers/tokens · `ui.tsx` buttons.
+`index.tsx` UI + timer state machine + plugin entry · `settings.ts` settings + enforcement latch · `vault.ts` encrypted config vault + strict-session seal · `environment.ts` DOM hiding, message filter, history block · `cortical.ts` + `corticalApp.ts` + `corticalLoadAsset.ts` the popup · `state.ts` shared refs + settings shortcut · `discord.ts` webpack lookups · `util.ts` helpers/tokens · `ui.tsx` buttons.
 
 ## Notes
 

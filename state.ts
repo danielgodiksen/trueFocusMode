@@ -9,6 +9,7 @@ export const api: Record<string, (() => void) | undefined> = {};
 
 export const regimeActiveRef = { current: false };   // hiding / blocking (includes always-on)
 export const sessionActiveRef = { current: false };  // a real timer session (drives lock-outs)
+export const strictBlockRef = { current: false };    // a strict-mode WORK block is running (blocks plugin disable)
 export const channelRef = { current: { id: null as string | null, ts: Date.now() } };
 export const msgTimesRef = { current: [] as { t: number; key: string; }[] };
 

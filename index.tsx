@@ -10,12 +10,16 @@
  * an in-client popup.
  *
  * A locked block is a commitment device: once started, settings are frozen and the
- * usual escapes (flip a setting, skip, reset) are gated. See settings.ts for the
- * enforcement latch and its honest limits (a client plugin can't survive quitting
- * Discord or on-disk edits).
+ * usual escapes (flip a setting, skip, reset) are gated. Strict mode goes further:
+ * the block persists through reloads/restarts via the encrypted vault, and the
+ * plugin refuses to be disabled mid-block. The vault also keeps the authoritative
+ * config encrypted in DataStore, so settings.json edits are reverted at startup —
+ * the Discord UI is the only sanctioned way to change config. See settings.ts and
+ * vault.ts for the honest limits (devtools/IndexedDB can still defeat all of it).
  *
- * Structure:  settings.ts (settings + latch) · environment.ts (DOM hiding, filter,
- * history) · cortical.ts (popup) · state.ts (shared refs) · util.ts · ui.tsx.
+ * Structure:  settings.ts (settings + latch) · vault.ts (encrypted config + strict
+ * session persistence) · environment.ts (DOM hiding, filter, history) · cortical.ts
+ * (popup) · state.ts (shared refs) · util.ts · ui.tsx.
  */
 
 import { ApplicationCommandInputType, ApplicationCommandOptionType, findOption, sendBotMessage } from "@api/Commands";
@@ -26,8 +30,9 @@ import { FluxDispatcher, React, UserStore } from "@webpack/common";
 import { populateCortical } from "./cortical";
 import { currentChannelId, ReactDOM } from "./discord";
 import { applyMsgFilter, injectStyle, patchHistory, removeStyle, setBodyClasses, stopMessageFilter } from "./environment";
-import { beginCommit, committedRef, E, endCommit, revertSettings, settings } from "./settings";
-import { api, channelRef, msgTimesRef, openSettings, regimeActiveRef, sessionActiveRef } from "./state";
+import { beginCommit, committedRef, E, endCommit, resumeCommit, revertSettings, settings } from "./settings";
+import { api, channelRef, msgTimesRef, openSettings, regimeActiveRef, sessionActiveRef, strictBlockRef } from "./state";
+import { clearSessionSeal, initVault, sealSession, stopVault, takePendingSession } from "./vault";
 import { Btn, LaunchBtn } from "./ui";
 import {
     ACCENT, fmt, GREEN, HEADER, MUTED, mins, Mode, PANEL, Phase, TXT, useDrag
@@ -85,7 +90,7 @@ function App() {
     // Regime is applied whenever this key changes. Reads go through `es` so a
     // locked block can't be weakened by toggling settings mid-block.
     const cssKey = [
-        regimeActive, sessionActive, st.phase, st.mode, es.alwaysOn,
+        regimeActive, sessionActive, st.phase, st.mode, es.alwaysOn, es.strictMode,
         es.hideChannels, es.restrictChannels, es.allowedChannelIds, es.hideServers, es.hideMembers,
         es.hideBackForward, es.hidePinned, es.hideThreads, es.hideDiscover, es.hideServerFolders,
         es.soloServerMode, es.soloServerId, es.keepHomeButton, es.allowedFoldersInPomodoro,
@@ -97,6 +102,7 @@ function App() {
         setBodyClasses(regimeActive, st.phase, st.mode);
         regimeActiveRef.current = regimeActive;
         sessionActiveRef.current = sessionActive;
+        strictBlockRef.current = committedRef.current && !!es.strictMode && st.running && st.phase === "work";
         patchHistory(regimeActive && es.hideBackForward);
         applyMsgFilter(regimeActive);
         if (regimeActive) channelRef.current = { id: currentChannelId(), ts: Date.now() };
@@ -125,6 +131,28 @@ function App() {
     }, [corticalOpen]);
 
     // ---- timer transitions -------------------------------------------------
+    // Persist a strict block into the vault so a reload/restart resumes it.
+    // Re-sealed every 15s from tick() so pauses (which push the end time out)
+    // and flowmodoro's count-up stay accurate across a restart.
+    const lastSealRef = React.useRef(0);
+    function sealNow() {
+        const s = stateRef.current;
+        if (!committedRef.current || !E().strictMode || !s.running || s.phase === "idle") return;
+        const now = Date.now();
+        const flowWork = s.phase === "work" && s.mode === "flowmodoro";
+        sealSession({
+            phase: s.phase as "work" | "break",
+            mode: s.mode,
+            endsAt: flowWork ? 0 : now + Math.max(0, s.remaining) * 1000,
+            startedAt: now - s.elapsed * 1000,
+            plannedLen: s.plannedLen,
+            cycle: s.cycle,
+            snapshot: { ...E() },
+            savedAt: now
+        });
+        lastSealRef.current = now;
+    }
+
     function startWork() {
         const s = stateRef.current;
         s.phase = "work"; s.running = true; s.paused = false; s.resting = false;
@@ -133,6 +161,7 @@ function App() {
         channelRef.current = { id: currentChannelId(), ts: Date.now() };
         msgTimesRef.current = [];
         rerender();
+        sealNow();
     }
     function startBreak() {
         const s = stateRef.current;
@@ -148,6 +177,7 @@ function App() {
         s.cycle += 1; s.phase = "break"; s.isBreakLong = long; s.paused = false; s.resting = false;
         s.total = secs; s.remaining = secs; s.running = true;
         rerender();
+        sealNow();
         notify("Break time", s.mode === "flowmodoro"
             ? `Worked ${fmt(s.elapsed)} → ${fmt(secs)} break.`
             : `Time for a ${long ? "long " : ""}break (${fmt(secs)}).`);
@@ -156,6 +186,7 @@ function App() {
 
     function tick() {
         if (committedRef.current) revertSettings();   // keep frozen settings frozen
+        if (Date.now() - lastSealRef.current > 15000) sealNow();   // keep the strict seal fresh
         const s = stateRef.current;
         if (sessionActiveRef.current && !s.paused && E().channelTimeLockout > 0 && channelRef.current.id) {
             if (Date.now() - channelRef.current.ts > E().channelTimeLockout * 60000) triggerLock("time");
@@ -200,13 +231,18 @@ function App() {
     function toggleRest() { const s = stateRef.current; if (s.phase !== "work") return; s.resting = !s.resting; s.paused = false; rerender(); }
 
     function onReset() {
-        if (committedRef.current && !E().allowAbort) return;   // unabortable within the client
+        // Unabortable within the client during the WORK block; the break between
+        // blocks is the sanctioned exit (otherwise a strict pomodoro chain could
+        // never end, since strict blocks now survive reloads too).
+        if (committedRef.current && !E().allowAbort && stateRef.current.phase === "work") return;
         const s = stateRef.current;
         s.phase = "idle"; s.running = false; s.paused = false; s.resting = false;
         s.elapsed = 0; s.cycle = 0; s.isBreakLong = false;
         s.total = mins(settings.store.workDuration) || 1500; s.remaining = s.total;
         abortArmed.current = false;
         endCommit();
+        clearSessionSeal();
+        strictBlockRef.current = false;
         rerender();
     }
     function onSkip() {
@@ -238,6 +274,34 @@ function App() {
 
     // ---- flux subscriptions + interval + slash-command api -----------------
     React.useEffect(() => {
+        // Resume a persisted strict block (reloading / restarting doesn't end it).
+        const pending = takePendingSession();
+        if (pending?.snapshot?.strictMode) {
+            const s = stateRef.current;
+            const now = Date.now();
+            const flowWork = pending.mode === "flowmodoro" && pending.phase === "work";
+            if (flowWork || now < pending.endsAt) {
+                s.mode = pending.mode; s.phase = pending.phase; s.running = true; s.paused = false; s.resting = false;
+                s.cycle = pending.cycle; s.plannedLen = pending.plannedLen; s.isBreakLong = false;
+                if (flowWork) {
+                    s.elapsed = Math.max(0, Math.floor((now - pending.startedAt) / 1000));
+                } else {
+                    s.remaining = Math.max(1, Math.ceil((pending.endsAt - now) / 1000));
+                    s.total = pending.phase === "work" ? (mins(pending.plannedLen) || s.remaining) : s.remaining;
+                }
+                channelRef.current = { id: currentChannelId(), ts: now };
+                msgTimesRef.current = [];
+                resumeCommit(pending.snapshot);
+                rerender();
+                notify("Strict block resumed", "Reloading doesn't end a strict block — the clock picked up where it left off.");
+            } else {
+                clearSessionSeal();
+                notify("Block complete", "Your strict block finished while Discord was closed.");
+            }
+        } else if (pending) {
+            clearSessionSeal();   // stale/non-strict seal — never resume it
+        }
+
         const onChannelSelect = (e: any) => {
             channelRef.current = { id: e?.channelId ?? currentChannelId(), ts: Date.now() };
             applyMsgFilter(regimeActiveRef.current);
@@ -326,7 +390,7 @@ function App() {
         ? Math.min(1, Math.max(0, 1 - st.remaining / st.total)) : (isFlowWork ? 1 : 0);
     const ratio = settings.store.flowmodoroRatio > 0 ? settings.store.flowmodoroRatio : 5;
     const locked = es.lockSession && st.running && st.phase === "work";
-    const canReset = !committedRef.current || es.allowAbort;
+    const canReset = !committedRef.current || es.allowAbort || st.phase === "break";
 
     return (
         <>
@@ -371,7 +435,7 @@ function App() {
                         </div>
 
                         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
-                            <span style={{ fontSize: 12, fontWeight: 700, textTransform: "uppercase", letterSpacing: .6, color: st.phase === "break" ? GREEN : ACCENT }}>{phaseLabel}{locked ? " · locked" : ""}</span>
+                            <span style={{ fontSize: 12, fontWeight: 700, textTransform: "uppercase", letterSpacing: .6, color: st.phase === "break" ? GREEN : ACCENT }}>{phaseLabel}{locked ? (es.strictMode ? " · strict" : " · locked") : ""}</span>
                             <span style={{ fontSize: 11, color: MUTED }}>sessions: {st.cycle}</span>
                         </div>
 
@@ -421,7 +485,9 @@ function App() {
                                 <>
                                     <div style={{ fontSize: 28, fontWeight: 800, textAlign: "center" }}>{confirmLen}<small style={{ fontSize: 13 }}>m</small></div>
                                     <input type="range" min={5} max={120} step={5} value={confirmLen} onChange={(e: any) => setConfirmLen(parseInt(e.target.value, 10))} style={{ width: "100%" }} />
-                                    <div style={{ fontSize: 11, color: MUTED }}>Length locks once you start{es.allowAbort ? "" : " and can't be aborted"}.</div>
+                                    <div style={{ fontSize: 11, color: MUTED }}>{settings.store.strictMode
+                                        ? "Strict block: unabortable, survives reloads & restarts."
+                                        : `Length locks once you start${es.allowAbort ? "" : " and can't be aborted"}.`}</div>
                                 </>
                             ) : (
                                 <div style={{ fontSize: 11.5, color: MUTED }}>Flowmodoro counts up; you commit to focusing until you choose to break.</div>
@@ -494,6 +560,7 @@ function App() {
 // ---------------------------------------------------------------------------
 let root: any = null;
 let container: HTMLElement | null = null;
+let started = false;   // guards the async vault-load → mount against a racing disable
 
 function mount() {
     if (container) return;
@@ -550,14 +617,33 @@ export default definePlugin({
         }
     ],
 
-    start() { injectStyle(); mount(); },
+    start() {
+        started = true;
+        injectStyle();
+        // The vault must load first: it restores the sealed (authoritative) config
+        // over settings.json and surfaces any persisted strict session, both of
+        // which the UI reads at mount. Mount anyway if the vault fails, so a
+        // crypto error can never brick the plugin.
+        initVault()
+            .catch(e => console.error("[trueFocusMode] vault init failed:", e))
+            .then(() => { if (started) mount(); });
+    },
     stop() {
+        if (strictBlockRef.current) {
+            // Refuse to stop mid-strict-block. Vencord catches this, reports the
+            // failure and leaves the plugin enabled — so flipping the toggle (or
+            // toggling then reloading) is not an escape from a strict block.
+            try { showNotification({ title: "trueFocusMode", body: "A strict block is running — the plugin can't be disabled until the block ends." }); } catch { /* */ }
+            throw new Error("trueFocusMode: a strict block is running; disabling is blocked until it ends.");
+        }
+        started = false;
         setBodyClasses(false, "idle", "pomodoro");
         patchHistory(false);
         stopMessageFilter();
         endCommit();
         unmount();
         removeStyle();
+        stopVault();
         regimeActiveRef.current = false;
         sessionActiveRef.current = false;
     }

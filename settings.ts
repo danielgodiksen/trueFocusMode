@@ -20,6 +20,7 @@ export const settings = definePluginSettings({
     confirmSessionLength: { type: OptionType.BOOLEAN, description: "Confirm the session length before starting", default: true },
     lockSession: { type: OptionType.BOOLEAN, description: "Lock a work block once started (freezes settings; no skip/reset)", default: true },
     allowAbort: { type: OptionType.BOOLEAN, description: "Allow aborting a locked block (off = unabortable; reload Discord to override)", default: true },
+    strictMode: { type: OptionType.BOOLEAN, description: "TRUE STRICT MODE: a locked block survives reload/restart, can never be aborted, and the plugin can't be disabled mid-block", default: false },
 
     // -- what to hide --------------------------------------------------------
     alwaysOn: { type: OptionType.BOOLEAN, description: "Keep hiding / blocking ON at all times, even with no session running", default: false },
@@ -64,14 +65,19 @@ export const settings = definePluginSettings({
  * This closes every "flip the setting to escape" bypass — abort, navigation,
  * hides and lock-outs all read the snapshot, so nothing can be weakened mid-block.
  *
- * Honest limit: a client plugin cannot make itself undeletable, cannot lock or
- * hide its settings file on disk, and cannot stop you quitting Discord — those
- * are OS-level. Quitting (or reloading) Discord always ends the block. This latch
- * only hardens the running client, which is where every listed bypass happens.
+ * The vault (vault.ts) extends this beyond the running client: the authoritative
+ * config is an encrypted copy in DataStore that overrides settings.json at
+ * startup, and a strict-mode block persists its snapshot + end time so a
+ * reload/restart resumes it instead of ending it.
+ *
+ * Honest limit: a client plugin cannot make itself undeletable and cannot stop
+ * you quitting Discord. What remains as escapes is deliberate, advanced tooling:
+ * devtools/IndexedDB surgery, changing the OS clock, or rebuilding Vencord
+ * without the plugin.
  * ------------------------------------------------------------------------- */
-const ENFORCE_KEYS = [
+export const ENFORCE_KEYS = [
     "technique", "workDuration", "breakDuration", "longBreakDuration", "pomodorosUntilLongBreak",
-    "flowmodoroRatio", "confirmSessionLength", "lockSession", "allowAbort", "alwaysOn",
+    "flowmodoroRatio", "confirmSessionLength", "lockSession", "allowAbort", "strictMode", "alwaysOn",
     "hideChannels", "restrictChannels", "allowedChannelIds", "hideServers", "hideMembers",
     "hideBackForward", "hidePinned", "hideThreads", "hideDiscover", "hideServerFolders",
     "allowedFoldersInPomodoro", "soloServerMode", "soloServerId", "keepHomeButton",
@@ -100,10 +106,25 @@ export function revertSettings() {
     }
 }
 
-/** Freeze settings for the session — only if the user opted into locked sessions. */
+/** Strict blocks are unabortable and always locked — force that into the snapshot
+ *  so E().allowAbort / E().lockSession can't disagree with strict mode. */
+function hardenSnapshot(snap: Record<string, any>): Record<string, any> {
+    if (snap.strictMode) { snap.lockSession = true; snap.allowAbort = false; }
+    return snap;
+}
+
+/** Freeze settings for the session — if the user opted into locked sessions or strict mode. */
 export function beginCommit() {
-    if (!settings.store.lockSession) return;
-    enforcedRef.current = snapshot();
+    if (!settings.store.lockSession && !settings.store.strictMode) return;
+    enforcedRef.current = hardenSnapshot(snapshot());
     committedRef.current = true;
 }
+
+/** Re-arm the latch from a persisted strict-session snapshot after a reload/restart. */
+export function resumeCommit(snap: Record<string, any>) {
+    enforcedRef.current = hardenSnapshot(snap);
+    committedRef.current = true;
+    revertSettings();   // the snapshot, not whatever is on disk, wins immediately
+}
+
 export function endCommit() { committedRef.current = false; enforcedRef.current = null; }
